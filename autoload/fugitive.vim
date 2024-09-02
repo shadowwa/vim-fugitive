@@ -7274,6 +7274,7 @@ function! s:BlameJump(suffix, ...) abort
   return ''
 endfunction
 
+let s:load_time = localtime()
 let s:hash_colors = {}
 
 function! fugitive#BlameSyntax() abort
@@ -7315,7 +7316,33 @@ function! fugitive#BlameSyntax() abort
   for x in split('01234567890abcdef', '\zs')
     exe 'syn match FugitiveblameHashGroup'.x '"\%(^\^\=[*?]*\)\@<='.x.'\x\{5,\}\>" nextgroup=FugitiveblameAnnotation,FugitiveblameOriginalLineNumber,fugitiveblameOriginalFile skipwhite'
   endfor
+
+  let oldest_commit = s:load_time
+  let newest_commit = 0
+  let date_seen = {}
   for lnum in range(1, line('$'))
+    " determine newest/oldest commit and calculate timestamps
+    if (getline(lnum) !~ "Not Committed Yet")
+      let first_date_match = matchlist(getline(lnum), '\<\(\d\d\d\d\)-\(\d\d\)-\(\d\d\).\(\d\d\):\(\d\d\):\(\d\d\) \([+-]\d\d\d\d\)\>')[0:7]
+      if !empty(first_date_match)
+        let datecommit = s:load_time - call(s:function('s:unixtime'), first_date_match[1:7])
+        let tscommit = call(s:function('s:unixtime'), first_date_match[1:7])
+      else
+        let match = matchlist(getline(lnum), '\<\(\d\+\) \([+-]\d\d\d\d\)\>')[0:2]
+        if !empty(match)
+          let tscommit = match[1]
+        endif
+      endif
+      if tscommit != 0
+        let date_seen[first_date_match[0]] = tscommit
+        if tscommit < oldest_commit
+          let oldest_commit = tscommit
+        endif
+        if tscommit > newest_commit
+          let newest_commit = tscommit
+        endif
+      endif
+    endif
     let orig_hash = matchstr(getline(lnum), '^\^\=[*?]*\zs\x\{6\}')
     let hash = orig_hash
     let hash = substitute(hash, '\(\x\)\x', '\=submatch(1).printf("%x", 15-str2nr(submatch(1),16))', 'g')
@@ -7339,11 +7366,58 @@ function! fugitive#BlameSyntax() abort
     let pattern = substitute(orig_hash, '^\(\x\)\x\(\x\)\x\(\x\)\x$', '\1\\x\2\\x\3\\x', '') . '*'
     exe 'syn match FugitiveblameHash'.hash.'       "\%(^\^\=[*?]*\)\@<='.pattern.'" contained containedin=FugitiveblameHashGroup' . orig_hash[0]
   endfor
+
+  " Calculate factors allowing to have 16 step streching from oldest_commit to newest_commit
+  " LOGARITHM: for index = c*log(time)+d formula
+  let timeunit = 1          " second    useless
+  let timeunit = 60         " minute
+  let timeunit = 60*60      " hour
+  let timeunit = 60*60*24   " day       seems the best choice for logarithm
+  let c = 15/log((newest_commit - oldest_commit)/timeunit)
+  let d = - 15*log(1)/log((newest_commit - oldest_commit)/timeunit)
+
+  " LINEAR: no additional factor needed
+
+  " QUADRATIC: for index = √(time)/a formula
+  let a = sqrt((newest_commit - oldest_commit))/15
+
+  for date_commit in keys(date_seen)
+    "TODO test *log existence only if using LOGARITHM method?
+    let age = newest_commit - date_seen[date_commit]
+    if exists('*log')
+      " LOGARITHM (with factors to get step at 1 day, 2 days, 3 days, 1 week, 2 weeks, 1 month, 3 month, 6 month, 1 years.)
+      " 65423.63**(0.78x)
+      "let staleness = age < 0 ? 0 : float2nr(ceil(log((1+age)/65423.63)/0.78))
+      " LOGARITHM: pro: focus on most recent logs - con: only use a small set of colors
+      "let staleness = age < 0 ? 0 : float2nr(ceil(c*log(1+age/timeunit)+d))
+      " LINEAR: pro: more chance to use all colors - con: no focus on most recent logs
+      "let staleness = (age) < 0 ? 0 : float2nr(age*15/(newest_commit - oldest_commit))
+      " QUADRATIC: pro: more chance to use all colors, focus on most recent logs - con: not intuitive to figure a date only by color
+      let staleness = (age) < 0 ? 0 : float2nr(sqrt(age)/a)
+
+      if staleness > 15 | let staleness = 15 | endif
+      exe 'syn match FugitiveblameTime'.staleness.' "\<'.date_commit.'\>" contained containedin=FugitiveblameAnnotation'
+    endif
+  endfor
+
   syn match FugitiveblameUncommitted "\%(^\^\=[?*]*\)\@<=\<0\{7,\}\>" nextgroup=FugitiveblameAnnotation,FugitiveblameScoreDebug,FugitiveblameOriginalLineNumber,FugitiveblameOriginalFile skipwhite
   call s:BlameRehighlight()
 endfunction
 
+function! s:HighlightBlameDates() abort
+  for i in range(0, 15)
+    let shade = 0x11 * (&background == 'dark' ? 0xf - i : i)
+    if &t_Co > 16 && exists('*csapprox#per_component#Approximate')
+      let cterm = ' ctermfg='.csapprox#per_component#Approximate(shade, shade, shade)
+    else
+      let cterm = ''
+    endif
+    execute 'hi FugitiveblameTime'.i.' guifg=#'.repeat(printf('%02x', shade),3).cterm
+  endfor
+endfunction
+
 function! s:BlameRehighlight() abort
+  call s:HighlightBlameDates()
   for [hash, cterm] in items(s:hash_colors)
     if !empty(cterm) || has('gui_running') || has('termguicolors') && &termguicolors
       exe 'hi FugitiveblameHash'.hash.' guifg=#' . hash . cterm
@@ -7351,6 +7425,18 @@ function! s:BlameRehighlight() abort
       exe 'hi link FugitiveblameHash'.hash.' Identifier'
     endif
   endfor
+endfunction
+
+function! s:unixtime(year,mon,day,hour,min,sec, ...) abort
+  let y = a:year + 4800 - (a:mon <= 2)
+  let m = a:mon + (a:mon <= 2 ? 9 : -3)
+  let jul = a:day + (153*m+2)/5 + 1461*y/4 - 32083
+  let days = jul - y/100 + y/400 + 38 - 2440588
+
+  let offset = a:0 ? a:1 : '0000'
+  let seconds = days * 86400 + a:hour * 3600 + a:min * 60 + a:sec
+  let seconds -= 3600 * matchstr(offset, '[+-]\=\d\d') - 60 * matchstr(offset, '\d\d$')
+  return seconds
 endfunction
 
 function! s:BlameMaps(is_ftplugin) abort
